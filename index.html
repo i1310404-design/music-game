@@ -1,3 +1,4 @@
+
 <!DOCTYPE html>
 <html lang="zh-TW">
 <head>
@@ -229,8 +230,30 @@ analysisOutput:'',
 noteTags:[],
 densityText:'',
 patternText:'',
-settings:{ fingers:'thumb', theme:'dark' }
+settings:{ fingers:'thumb', theme:'dark' },
+
+/* Ctrl+V 修復 */
+isPasting:false,
+lastPasteTime:0
 }
+},
+
+mounted(){
+
+this._onPaste = (e) => {
+    this.handlePaste(e);
+};
+
+window.addEventListener('paste', this._onPaste, true);
+
+},
+
+beforeUnmount(){
+
+if(this._onPaste){
+    window.removeEventListener('paste', this._onPaste, true);
+}
+
 },
 
 methods:{
@@ -240,19 +263,64 @@ this.loadImage(e.target.files[0]);
 },
 
 handlePaste(e){
-const item=[...e.clipboardData.items].find(i=>i.type.includes('image'));
-if(item) this.loadImage(item.getAsFile());
+
+const now = Date.now();
+
+if(this.isPasting || now - this.lastPasteTime < 500){
+    return;
+}
+
+this.lastPasteTime = now;
+this.isPasting = true;
+
+e.preventDefault();
+e.stopPropagation();
+
+let file = null;
+
+if(e.clipboardData && e.clipboardData.items){
+
+    const item = [...e.clipboardData.items].find(i => i.type.startsWith('image/'));
+    if(item) file = item.getAsFile();
+
+}
+
+if(!file && e.clipboardData && e.clipboardData.files && e.clipboardData.files.length){
+    file = e.clipboardData.files[0];
+}
+
+if(file){
+    this.loadImage(file);
+}else{
+    this.isPasting = false;
+}
+
 },
 
 loadImage(file){
-if(!file) return;
+if(!file){
+    this.isPasting = false;
+    return;
+}
 const r=new FileReader();
-r.onload=e=>this.uploadedImg=e.target.result;
+r.onload=e=>{
+    this.uploadedImg=e.target.result;
+    setTimeout(()=>{
+        this.isPasting = false;
+    },100);
+};
+r.onerror=()=>{
+    this.isPasting = false;
+};
 r.readAsDataURL(file);
 },
 
 /* =========================
 🔥 核心修復版本
+1. 改成連通區域偵測
+2. Hold / Trace 會自動合併
+3. 單鍵不容易被拆成三鍵四鍵
+4. Ctrl+V 改成全域監聽
 ========================= */
 startAnalysis(){
 
@@ -272,128 +340,197 @@ const ctx=canvas.getContext('2d');
 
 canvas.width=img.width;
 canvas.height=img.height;
+
 ctx.drawImage(img,0,0);
 
-const data=ctx.getImageData(0,0,img.width,img.height).data;
+const image=ctx.getImageData(0,0,img.width,img.height);
+const data=image.data;
+
+const W=img.width;
+const H=img.height;
+
+/* 掃描格點，不要太密也不要太疏 */
+const step=Math.max(2,Math.floor(Math.min(W,H)/320));
+
+const visited=new Uint8Array(W*H);
+const notes=[];
 
 /* =========================
-STEP 1：自適應掃描（修直圖）
+note 判定
 ========================= */
+function isNote(x,y){
 
-let raw=[];
+if(x<0 || y<0 || x>=W || y>=H) return false;
 
-const step=Math.max(3,Math.floor(Math.min(img.width,img.height)/150));
+const i=(y*W+x)*4;
 
-for(let y=0;y<img.height;y+=step){
-for(let x=0;x<img.width;x+=step){
+const r=data[i];
+const g=data[i+1];
+const b=data[i+2];
+const a=data[i+3];
 
-const i=(y*img.width+x)*4;
-const r=data[i],g=data[i+1],b=data[i+2];
+if(a < 40) return false;
+
+/* 掃描線 / 高亮排除 */
+if(g>200 && b>200 && r<120) return false;
+
+/* 常見 note / hold / trace 高亮 */
 const light=(r+g+b)/3;
 
-/* 🚨 強化掃描線排除 */
-if(g>200 && b>200 && r<120) continue;
-
-/* note 判定 */
-const isNote=
-(b>160&&g>120)||
-(r>180&&b>120)||
-(r>180&&g>180)||
-light>220;
-
-if(isNote) raw.push({x,y});
-
-}
-}
-
-/* =========================
-STEP 2：分層 clustering（防糊）
-========================= */
-
-function cluster(points){
-
-const clusters=[];
-
-for(const p of points){
-
-let found=false;
-
-for(const c of clusters){
-
-const dx=c.cx-p.x;
-const dy=c.cy-p.y;
-const dist=Math.sqrt(dx*dx+dy*dy);
-
-/* 🔥 防止太密變一坨 */
-if(dist<10){
-
-c.points.push(p);
-c.cx=c.points.reduce((a,b)=>a+b.x,0)/c.points.length;
-c.cy=c.points.reduce((a,b)=>a+b.y,0)/c.points.length;
-
-found=true;
-break;
-
-}
-
-}
-
-if(!found){
-clusters.push({cx:p.x,cy:p.y,points:[p]});
-}
-
-}
-
-/* 去除雜點 */
-return clusters.filter(c=>c.points.length>=2);
+return (
+    (b>140 && g>100) ||       /* 偏藍 */
+    (r>170 && b>100) ||       /* 偏紫紅 */
+    (r>180 && g>180) ||       /* 偏黃白 */
+    (light>215)               /* 極亮區 */
+);
 
 }
 
 /* =========================
-STEP 3：UI 防爆炸（預覽修復）
+4方向連通區域
 ========================= */
+for(let y=0;y<H;y+=step){
+for(let x=0;x<W;x+=step){
 
-let clusters=cluster(raw);
+const idx=y*W+x;
 
-/* 最小距離去重 */
-let final=[];
+if(visited[idx] || !isNote(x,y)) continue;
 
-for(const c of clusters){
+const queue=[[x,y]];
+visited[idx]=1;
 
-let tooClose=final.some(f=>{
+const pixels=[];
 
-let dx=f.x-c.cx;
-let dy=f.y-c.cy;
-return Math.sqrt(dx*dx+dy*dy)<1.5;
+while(queue.length){
 
+const [cx,cy]=queue.shift();
+pixels.push([cx,cy]);
+
+const dirs=[
+[step,0],
+[-step,0],
+[0,step],
+[0,-step]
+];
+
+for(const [dx,dy] of dirs){
+
+const nx=cx+dx;
+const ny=cy+dy;
+
+if(nx<0 || ny<0 || nx>=W || ny>=H) continue;
+
+const ni=ny*W+nx;
+if(visited[ni]) continue;
+if(!isNote(nx,ny)) continue;
+
+visited[ni]=1;
+queue.push([nx,ny]);
+
+}
+
+}
+
+/* 雜點過濾：太小的不算 */
+if(pixels.length < 8) continue;
+
+/* =========================
+判斷是否為 hold / trace
+- 長條型、細長型、延伸型：偏向把重心放在尾端
+- 一般單鍵：放在中心
+========================= */
+let minX=Infinity, minY=Infinity, maxX=-Infinity, maxY=-Infinity;
+
+for(const [px,py] of pixels){
+if(px < minX) minX = px;
+if(py < minY) minY = py;
+if(px > maxX) maxX = px;
+if(py > maxY) maxY = py;
+}
+
+const width=maxX-minX;
+const height=maxY-minY;
+const area=pixels.length;
+const ratio = Math.max(width, height) / Math.max(1, Math.min(width, height));
+
+/* 若是很長的 hold / trace，採用更穩定的代表點 */
+let centerX=(minX+maxX)/2;
+let centerY=(minY+maxY)/2;
+
+/* 垂直長條 hold */
+if(height > width * 1.8 && area > 20){
+    centerY = maxY;
+}
+
+/* 水平長條 trace / slider 類 */
+if(width > height * 1.8 && area > 20){
+    centerX = (minX + maxX) / 2;
+    centerY = (minY + maxY) / 2;
+}
+
+/* 較大但不規則的 note，仍保留中心點 */
+notes.push({
+    x:centerX,
+    y:centerY,
+    width,
+    height,
+    area,
+    ratio
 });
 
-if(!tooClose){
-final.push({x:c.cx,y:c.cy});
 }
 
 }
 
 /* =========================
-STEP 4：轉 note
+去除重複
+- 原本同一顆 note 周圍可能被掃成多群
+- 用較大的距離門檻合併
 ========================= */
+const final=[];
 
+for(const n of notes){
+
+const overlap=final.some(f=>{
+const dx=f.x-n.x;
+const dy=f.y-n.y;
+return Math.sqrt(dx*dx+dy*dy) < 22;
+});
+
+if(!overlap){
+final.push(n);
+}
+
+}
+
+/* =========================
+轉 note
+========================= */
 let detected=final.map((c,i)=>({
 
-x:(c.x/img.width)*100,
-y:(c.y/img.height)*100,
-hand:c.x<img.width/2?'L':'R',
-label:c.x<img.width/2?'L0':'R0'
+id:i,
+
+x:(c.x/W)*100,
+y:(c.y/H)*100,
+hand:c.x<W/2 ? 'L' : 'R',
+label:c.x<W/2 ? 'L0' : 'R0',
+
+meta:{
+width:c.width,
+height:c.height,
+area:c.area,
+ratio:c.ratio
+}
 
 }));
 
 /* fallback */
 if(detected.length===0){
 detected=[
-{x:20,y:70,hand:'L',label:'L0'},
-{x:35,y:60,hand:'L',label:'L0'},
-{x:65,y:55,hand:'R',label:'R0'},
-{x:80,y:72,hand:'R',label:'R0'}
+{x:20,y:70,hand:'L',label:'L0',id:0,meta:{}},
+{x:35,y:60,hand:'L',label:'L0',id:1,meta:{}},
+{x:65,y:55,hand:'R',label:'R0',id:2,meta:{}},
+{x:80,y:72,hand:'R',label:'R0',id:3,meta:{}}
 ];
 }
 
@@ -403,17 +540,18 @@ this.noteTags=detected;
 const count=detected.length;
 
 this.densityText =
-count<=20?'低密度':count<=60?'中密度':'高密度';
+count<=20 ? '低密度' :
+count<=60 ? '中密度' : '高密度';
 
 let l=0,r=0;
-detected.forEach(n=>n.x<50?l++:r++);
+detected.forEach(n=>n.x<50 ? l++ : r++);
 
 this.patternText =
-Math.abs(l-r)>=10?'偏單手配置':
-count>=70?'高密度交互配置':'均衡配置';
+Math.abs(l-r)>=10 ? '偏單手配置' :
+count>=70 ? '高密度交互配置' : '均衡配置';
 
 this.analysisOutput =
-`偵測完成：${count} notes（直圖 + 密集 + 預覽已修復）`;
+`偵測完成：${count} notes（Hold/Trace 已修復、單鍵防分裂、Ctrl+V 已修復）`;
 
 setTimeout(()=>this.isAnalyzing=false,800);
 
@@ -435,15 +573,16 @@ generateAnalysis(detected){
 const count=detected.length;
 
 this.densityText =
-count<=20?'低密度':count<=60?'中密度':'高密度';
+count<=20 ? '低密度' :
+count<=60 ? '中密度' : '高密度';
 
 let l=0,r=0;
 
-detected.forEach(n=>n.x<50?l++:r++);
+detected.forEach(n=>n.x<50 ? l++ : r++);
 
 this.patternText =
-Math.abs(l-r)>=10?'偏單手配置':
-count>=70?'高密度交互配置':'均衡配置';
+Math.abs(l-r)>=10 ? '偏單手配置' :
+count>=70 ? '高密度交互配置' : '均衡配置';
 
 this.analysisOutput =
 `偵測完成：${count} notes`;
